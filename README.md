@@ -49,7 +49,7 @@
 
 1.  克隆仓库：
     ```bash
-    git clone [https://github.com/你的用户名/你的仓库名.git](https://github.com/你的用户名/你的仓库名.git)
+   (https://github.com/Sam121-chang/-3D-saturn)
     ```
 2.  使用 **VSCode** 打开文件夹。
 3.  安装 **Live Server** 插件。
