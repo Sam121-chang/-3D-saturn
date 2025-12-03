@@ -12,8 +12,8 @@
 
 核心亮点在于结合了 **Google MediaPipe** 手势识别技术，允许用户通过**摄像头**实时控制星系的演变：从有序的开普勒轨道运动，到热力学极端的混沌炸裂状态。
 
-**✨ 在线体验 (Demo):** [点击这里进入沉浸模式]([(https://github.com/Sam121-chang/-3D-saturn))
-*(请替换上面的链接为你 GitHub Pages 的实际链接)*
+**✨ 在线体验 (Demo):** [点击这里进入沉浸模式]([(https://github.com/Sam121-chang/-3D-saturn)[)
+
 
 ## 🎮 How to Control (交互方式)
 
