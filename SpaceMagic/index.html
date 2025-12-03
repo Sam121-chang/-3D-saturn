@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Saturn Particle System - V3 Ultimate</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Helvetica Neue', Arial, sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        #ui-layer {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            z-index: 10; text-align: center; pointer-events: none;
+            color: rgba(255, 255, 255, 0.8); width: 100%;
+        }
+        h1 { font-weight: 200; letter-spacing: 4px; font-size: 14px; margin: 0 0 10px 0; text-transform: uppercase; }
+        #status { font-size: 16px; color: #4db8ff; margin-bottom: 20px; text-shadow: 0 0 10px #4db8ff; font-weight: bold; }
+        
+        /* 调试窗口：现在会画出红线 */
+        #debug-container {
+            position: absolute; bottom: 20px; right: 20px; 
+            width: 240px; height: 180px; 
+            border: 2px solid rgba(255,255,255,0.3); 
+            border-radius: 8px; z-index: 100; opacity: 0.9;
+            background: rgba(0,0,0,0.5);
+            overflow: hidden;
+        }
+        #webcam, #output_canvas { 
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+            transform: scaleX(-1); /* 镜像翻转 */
+        }
+        
+        .mode-badge {
+            display: inline-block; padding: 4px 8px; border-radius: 4px; 
+            font-size: 12px; margin-bottom: 10px; font-weight: bold;
+        }
+        .mode-ai { background: rgba(0, 255, 100, 0.2); color: #00ff66; border: 1px solid #00ff66; }
+        .mode-light { background: rgba(255, 200, 0, 0.2); color: #ffcc00; border: 1px solid #ffcc00; }
+        
+        #loading {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 20; display: flex; justify-content: center; align-items: center; flex-direction: column; color: #fff;
+            transition: opacity 1s;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">
+        <div style="font-size: 24px; margin-bottom: 20px;">🪐</div>
+        <div id="loading-text">正在尝试连接 AI 卫星...<br><span style="font-size:12px; opacity:0.6">如果失败将自动切换到光感应备用模式</span></div>
+    </div>
+
+    <div id="ui-layer">
+        <h1>Saturn Protocol // V3 Ultimate</h1>
+        <div id="mode-indicator" style="margin-bottom: 5px;"></div>
+        <div id="status">系统初始化...</div>
+        <p style="font-size: 10px; opacity: 0.5;">提示：鼠标点击可随时强制接管控制权</p>
+    </div>
+
+    <div id="canvas-container"></div>
+    
+    <div id="debug-container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { FilesetResolver, HandLandmarker, DrawingUtils } from '@mediapipe/tasks-vision';
+
+        // --- 全局变量 ---
+        let controlMode = "INIT"; // INIT, AI, LIGHT, MOUSE
+        let finalZoom = 0;
+        let smoothedZoom = 0;
+        let mouseZoom = -1;
+        
+        // 视觉相关
+        let renderer, scene, camera, composer, particleSystem, uniforms;
+        
+        // AI/视频相关
+        let handLandmarker;
+        let video = document.getElementById('webcam');
+        let canvasElement = document.getElementById('output_canvas');
+        let canvasCtx = canvasElement.getContext('2d');
+        let drawingUtils;
+        let lastVideoTime = -1;
+        let brightnessBase = 0; // 光感应基准
+
+        // --- 初始化流程 ---
+        async function init() {
+            setupThreeJS();
+            createSaturnSystem();
+            setupMouseInput();
+            
+            // 启动摄像头
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                video.srcObject = stream;
+                await new Promise(r => { video.onloadeddata = () => { video.play(); r(); } });
+                
+                // 设置画布尺寸匹配视频
+                canvasElement.width = video.videoWidth;
+                canvasElement.height = video.videoHeight;
+                
+                // 计算初始环境亮度（用于光感应模式）
+                brightnessBase = calculateBrightness();
+                console.log("Base Brightness:", brightnessBase);
+
+            } catch (err) {
+                alert("摄像头启动失败，请检查权限");
+                return;
+            }
+
+            // 尝试加载 AI (设置3秒超时，超时就切光感应)
+            updateStatus("正在连接 AI 模型...", "INIT");
+            
+            const aiPromise = setupMediaPipe();
+            const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve('TIMEOUT'), 5000));
+
+            const result = await Promise.race([aiPromise, timeoutPromise]);
+
+            if (result === 'SUCCESS') {
+                controlMode = "AI";
+                updateStatus("AI 核心已连接 - 请展示手掌", "AI");
+                drawingUtils = new DrawingUtils(canvasCtx);
+            } else {
+                controlMode = "LIGHT";
+                updateStatus("AI 连接超时 - 已切换至 [光感应模式]", "LIGHT");
+                document.getElementById('status').innerText += "\n(请张开手掌靠近摄像头，利用反光控制)";
+            }
+
+            document.getElementById('loading').style.opacity = 0;
+            setTimeout(() => document.getElementById('loading').style.display = 'none', 1000);
+
+            animate();
+        }
+
+        // --- 核心逻辑：输入处理 ---
+        function processInput() {
+            // 1. 鼠标最高优先级
+            if (mouseZoom !== -1) {
+                return mouseZoom;
+            }
+
+            // 2. AI 模式
+            if (controlMode === "AI") {
+                if (detectHandAI()) {
+                    return getHandOpennessAI();
+                } else {
+                    return 0; // 没手就归零
+                }
+            }
+
+            // 3. 光感应模式 (备用)
+            if (controlMode === "LIGHT") {
+                return detectLightIntensity();
+            }
+
+            return 0;
+        }
+
+        // --- 策略 A: AI 检测 ---
+        let aiResults = null;
+        async function setupMediaPipe() {
+            try {
+                const vision = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+                );
+                handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    numHands: 1
+                });
+                return 'SUCCESS';
+            } catch (e) {
+                console.warn("AI Load Error:", e);
+                return 'FAIL';
+            }
+        }
+
+        function detectHandAI() {
+            if (!handLandmarker) return false;
+            // 清空画布
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            if (video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                aiResults = handLandmarker.detectForVideo(video, performance.now());
+            }
+
+            if (aiResults && aiResults.landmarks.length > 0) {
+                // 画出骨架 (Debug)
+                for (const landmarks of aiResults.landmarks) {
+                    drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, { color: "#00FF00", lineWidth: 3 });
+                    drawingUtils.drawLandmarks(landmarks, { color: "#FF0000", lineWidth: 1 });
+                }
+                return true;
+            }
+            return false;
+        }
+
+        function getHandOpennessAI() {
+            const lm = aiResults.landmarks[0];
+            const wrist = lm[0];
+            const tips = [lm[4], lm[8], lm[12], lm[16], lm[20]];
+            const palmRef = lm[9]; 
+            
+            const dist = (p1, p2) => Math.sqrt(Math.pow(p1.x-p2.x, 2) + Math.pow(p1.y-p2.y, 2));
+            const palmSize = dist(wrist, palmRef);
+            let avgTipDist = 0;
+            tips.forEach(tip => avgTipDist += dist(wrist, tip));
+            avgTipDist /= 5;
+
+            // 宽松的算法
+            let ratio = avgTipDist / palmSize;
+            let val = (ratio - 0.5) / (1.7 - 0.5);
+            return Math.max(0, Math.min(1, val));
+        }
+
+        // --- 策略 B: 光感应 (Fallback) ---
+        function calculateBrightness() {
+            // 采样画面中心 50x50 的区域
+            const w = canvasElement.width;
+            const h = canvasElement.height;
+            // 临时画在 hidden canvas 上取值太慢，直接利用 canvasCtx (video已不再画在上面，但我们可以利用 getImageData)
+            // 为了性能，我们只采样几个点
+            // 这里简单模拟：假设手掌靠近会显著增加画面中间的亮度（肤色通常比背景亮）
+            // 注意：这需要我们把视频帧画到一个小的离屏canvas上
+            return 0; // 简化版不真正计算，依赖 detectLightIntensity 的实时计算
+        }
+
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = 32; tempCanvas.height = 32; // 极低分辨率
+        const tempCtx = tempCanvas.getContext('2d');
+
+        function detectLightIntensity() {
+            // 把视频画到 32x32 的画布上
+            tempCtx.drawImage(video, 0, 0, 32, 32);
+            const frame = tempCtx.getImageData(0, 0, 32, 32);
+            const data = frame.data;
+            let total = 0;
+            for(let i = 0; i < data.length; i += 4) {
+                total += (data[i] + data[i+1] + data[i+2]) / 3;
+            }
+            const avg = total / (32 * 32);
+            
+            // 动态校准：如果当前亮度比基准高，说明有东西（手）遮挡或靠近
+            // 通常：手掌（浅色）靠近黑色背景 = 变亮
+            // 阈值算法
+            let diff = avg - brightnessBase;
+            // 敏感度放大
+            let val = diff / 40.0; // 亮度增加40个单位算满
+            
+            // 慢慢更新基准，适应环境光变化
+            if (val < 0.1) brightnessBase = brightnessBase * 0.99 + avg * 0.01;
+            
+            return Math.max(0, Math.min(1, val));
+        }
+
+        // --- Three.js & Shader (保持极致画质) ---
+        // (省略了重复的 setupThreeJS 和 createSaturnSystem 代码细节，直接复用上个版本的核心逻辑)
+        // 为了代码简洁，我将核心 Shader 和 创建函数合并在此
+        
+        const vertexShader = `
+            uniform float uTime; uniform float uZoom;
+            attribute float aSize; attribute float aSpeed; attribute float aRadius;
+            attribute float aAngleOffset; attribute float aRandom; attribute vec3 aChaosDir;
+            varying vec3 vColor; varying float vAlpha;
+            void main() {
+                float currentAngle = aAngleOffset + (uTime * aSpeed);
+                vec3 orbitPos;
+                orbitPos.x = cos(currentAngle) * aRadius;
+                orbitPos.z = sin(currentAngle) * aRadius;
+                orbitPos.y = sin(currentAngle * 2.0 + aRandom * 10.0) * (aRadius * 0.05);
+                float expansionFactor = 1.0 + uZoom * 4.0; 
+                vec3 expandedPos = orbitPos * expansionFactor;
+                vec3 chaosPos = expandedPos;
+                if (uZoom > 0.8) {
+                    float timeJitter = sin(uTime * 30.0 + aRandom * 100.0);
+                    vec3 jitter = aChaosDir * timeJitter * 0.2;
+                    vec3 explode = aChaosDir * (uZoom - 0.8) * 15.0;
+                    chaosPos = expandedPos + jitter + explode;
+                }
+                float chaosMix = smoothstep(0.8, 1.0, uZoom);
+                vec3 finalPos = mix(expandedPos, chaosPos, chaosMix);
+                vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+                float sizeZoomBoost = 1.0 + uZoom * 2.0;
+                gl_PointSize = aSize * sizeZoomBoost * (300.0 / -mvPosition.z);
+                float brightness = 0.3 + uZoom * 1.5;
+                vec3 coreColor = vec3(0.9, 0.7, 0.4);
+                vec3 ringColor = vec3(0.6, 0.7, 0.8);
+                float colorMix = smoothstep(2.0, 6.0, aRadius);
+                vec3 baseCol = mix(coreColor, ringColor, colorMix);
+                vColor = mix(baseCol, vec3(1.0, 1.0, 1.0), chaosMix * 0.8);
+                vColor *= brightness;
+                vAlpha = 1.0;
+            }
+        `;
+        const fragmentShader = `
+            varying vec3 vColor; varying float vAlpha;
+            void main() {
+                vec2 center = gl_PointCoord - 0.5;
+                float dist = length(center);
+                if (dist > 0.5) discard;
+                float strength = 1.0 - (dist * 2.0);
+                strength = pow(strength, 1.5);
+                gl_FragColor = vec4(vColor, vAlpha * strength);
+            }
+        `;
+
+        function setupThreeJS() {
+            const container = document.getElementById('canvas-container');
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.02);
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 20; camera.position.y = 5; camera.lookAt(0, 0, 0);
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0.1; bloomPass.strength = 1.2; bloomPass.radius = 0.5;
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                composer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        function createSaturnSystem() {
+            // (Same geometry creation as V2)
+            const geometry = new THREE.BufferGeometry();
+            const positions = []; const sizes = []; const speeds = []; const radii = []; 
+            const angles = []; const randoms = []; const chaosDirs = [];
+            const CONFIG = { particleCount: 80000 };
+
+            for (let i = 0; i < CONFIG.particleCount; i++) {
+                let r, size;
+                const isCore = Math.random() < 0.25;
+                if (isCore) {
+                    r = Math.cbrt(Math.random()) * 2.0; size = Math.random() * 0.5 + 0.5;
+                } else {
+                    r = 3.5 + Math.random() * (10.0 - 3.5);
+                    if (r > 6.0 && r < 6.5) r += 0.5; 
+                    size = Math.random() * 0.3 + 0.2;
+                }
+                let speed = isCore ? 0.2 : (2.0 / Math.sqrt(r)); 
+                speed *= (Math.random() > 0.5 ? 1 : 1); 
+                const cx = (Math.random() - 0.5) * 2; const cy = (Math.random() - 0.5) * 2; const cz = (Math.random() - 0.5) * 2;
+                const cDir = new THREE.Vector3(cx, cy, cz).normalize();
+                positions.push(0, 0, 0); sizes.push(size); speeds.push(speed * 0.2);
+                radii.push(r); angles.push(Math.random() * Math.PI * 2);
+                randoms.push(Math.random()); chaosDirs.push(cDir.x, cDir.y, cDir.z);
+            }
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('aSize', new THREE.Float32BufferAttribute(sizes, 1));
+            geometry.setAttribute('aSpeed', new THREE.Float32BufferAttribute(speeds, 1));
+            geometry.setAttribute('aRadius', new THREE.Float32BufferAttribute(radii, 1));
+            geometry.setAttribute('aAngleOffset', new THREE.Float32BufferAttribute(angles, 1));
+            geometry.setAttribute('aRandom', new THREE.Float32BufferAttribute(randoms, 1));
+            geometry.setAttribute('aChaosDir', new THREE.Float32BufferAttribute(chaosDirs, 3));
+            uniforms = { uTime: { value: 0 }, uZoom: { value: 0 } };
+            const material = new THREE.ShaderMaterial({
+                uniforms: uniforms, vertexShader: vertexShader, fragmentShader: fragmentShader,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+            });
+            particleSystem = new THREE.Points(geometry, material);
+            particleSystem.rotation.z = 25 * (Math.PI / 180); 
+            particleSystem.rotation.x = 10 * (Math.PI / 180);
+            scene.add(particleSystem);
+        }
+
+        function setupMouseInput() {
+            const handleMouse = (y) => {
+                mouseZoom = 1.0 - (y / window.innerHeight);
+                document.getElementById('status').innerText = `鼠标强制控制: ${(mouseZoom*100).toFixed(0)}%`;
+                controlMode = "MOUSE"; // 强制切换
+            };
+            window.addEventListener('mousedown', (e) => handleMouse(e.clientY));
+            window.addEventListener('mousemove', (e) => { if(e.buttons === 1) handleMouse(e.clientY); });
+            window.addEventListener('mouseup', () => { 
+                mouseZoom = -1; 
+                controlMode = handLandmarker ? "AI" : "LIGHT"; // 恢复
+                document.getElementById('status').innerText = controlMode === "AI" ? "AI 恢复接管" : "光感应模式恢复";
+            });
+            // Touch
+            window.addEventListener('touchmove', (e) => handleMouse(e.touches[0].clientY));
+            window.addEventListener('touchend', () => { mouseZoom = -1; controlMode = handLandmarker ? "AI" : "LIGHT"; });
+        }
+
+        function updateStatus(text, mode) {
+            const el = document.getElementById('status');
+            const badge = document.getElementById('mode-indicator');
+            el.innerText = text;
+            if (mode === 'AI') badge.innerHTML = '<span class="mode-badge mode-ai">● AI MODEL ONLINE</span>';
+            if (mode === 'LIGHT') badge.innerHTML = '<span class="mode-badge mode-light">● LIGHT SENSOR MODE</span>';
+        }
+
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 获取目标缩放值
+            let target = processInput();
+            
+            // 平滑处理 (Lerp)
+            smoothedZoom += (target - smoothedZoom) * 0.1;
+
+            if (uniforms) {
+                uniforms.uTime.value = clock.getElapsedTime();
+                uniforms.uZoom.value = smoothedZoom;
+            }
+
+            composer.render();
+            
+            // Debug Loop Info
+            if(controlMode === "LIGHT") {
+               // 如果是光感应模式，稍微更新一下状态文字里的数值
+               // document.getElementById('status').innerText = `光感应强度: ${(target*100).toFixed(0)}%`;
+            }
+        }
+        
+        init();
+
+    </script>
+</body>
+</html>
