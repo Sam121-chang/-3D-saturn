@@ -47,9 +47,9 @@
 
 如果你想在本地修改代码：
 
-1.  克隆仓库：
-    ```bash(https://github.com/Sam121-chang/-3D-saturn)
-    ```
+1.  克隆仓库：(https://github.com/Sam121-chang/-3D-saturn)
+    
+    
 2.  使用 **VSCode** 打开文件夹。
 3.  安装 **Live Server** 插件。
 4.  右键 `index.html` 选择 **"Open with Live Server"**。
